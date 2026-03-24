@@ -1,8 +1,18 @@
 """
 Generate SDF (Signed Distance Function) volumes from FreeSurfer cortical surfaces.
+FAST VERSION - uses surface rasterization + flood fill + EDT
+(replaces slow trimesh.contains() method)
 
 Converts FreeSurfer surface meshes (lh.pial, rh.pial, lh.white, rh.white)
 into 3D SDF volumes (.nii.gz) for Cor2Vox training.
+
+Method:
+    1. Rasterize surface triangles into a thin shell in voxel space
+    2. Flood fill (binary_fill_holes) to find interior region
+    3. Compute EDT from shell for inside/outside
+    4. SDF = outside_distance - inside_distance
+
+Speed: ~10-30 sec per subject (vs hours with trimesh.contains)
 
 Input:
     - FreeSurfer subjects directory containing surf/ and mri/ folders
@@ -14,7 +24,6 @@ Usage:
     python generate_sdf.py \
         --fs_dir /data/datasets/CamCAN/freesurfer \
         --output_dir /data/yunmin0111/dataset \
-        --resolution 256 \
         --num_workers 4
 """
 
@@ -22,8 +31,7 @@ import os
 import argparse
 import numpy as np
 import nibabel as nib
-import trimesh
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, binary_fill_holes
 from multiprocessing import Pool
 from tqdm import tqdm
 import logging
@@ -36,115 +44,109 @@ logging.basicConfig(
 LOG = logging.getLogger(__name__)
 
 
-def surface_to_volume_mask(vertices, faces, vol_shape, affine):
+def rasterize_triangles_fast(vertices, faces, vol_shape):
     """
-    Rasterize a surface mesh into a binary volume.
-    Voxels inside the mesh are set to 1, outside to 0.
+    Fast triangle rasterization: fill bounding box of each triangle.
+    Creates a thin shell volume marking surface voxels.
 
     Args:
-        vertices: (N, 3) array of vertex coordinates in world (RAS) space
-        faces: (M, 3) array of triangle face indices
-        vol_shape: tuple (H, W, D) shape of the output volume
-        affine: (4, 4) voxel-to-world affine matrix
+        vertices: (N, 3) voxel-space coordinates (float)
+        faces: (M, 3) triangle indices
+        vol_shape: (H, W, D)
 
     Returns:
-        mask: (H, W, D) binary numpy array
+        shell: (H, W, D) binary volume (uint8)
     """
-    # Convert world coordinates to voxel coordinates
-    inv_affine = np.linalg.inv(affine)
-    voxel_coords = nib.affines.apply_affine(inv_affine, vertices)
-
-    # Create trimesh object in voxel space
-    mesh = trimesh.Trimesh(vertices=voxel_coords, faces=faces, process=False)
-
-    # Create a voxel grid and check which voxels are inside the mesh
-    # Use ray-based method for inside/outside determination
     H, W, D = vol_shape
-    mask = np.zeros(vol_shape, dtype=np.uint8)
+    shell = np.zeros(vol_shape, dtype=np.uint8)
 
-    # Generate grid points (center of each voxel)
-    grid_points = np.mgrid[0:H, 0:W, 0:D].reshape(3, -1).T.astype(np.float64) + 0.5
+    tri_verts = vertices[faces]  # (M, 3, 3)
 
-    # Check containment in batches to avoid memory issues
-    batch_size = 100000
-    inside = np.zeros(len(grid_points), dtype=bool)
+    # Compute bounding boxes for all triangles at once
+    tri_min = np.floor(tri_verts.min(axis=1)).astype(np.int32)  # (M, 3)
+    tri_max = np.ceil(tri_verts.max(axis=1)).astype(np.int32)   # (M, 3)
 
-    for start in range(0, len(grid_points), batch_size):
-        end = min(start + batch_size, len(grid_points))
-        batch = grid_points[start:end]
-        inside[start:end] = mesh.contains(batch)
+    # Clamp to volume bounds
+    tri_min = np.maximum(tri_min, 0)
+    tri_max[:, 0] = np.minimum(tri_max[:, 0], H - 1)
+    tri_max[:, 1] = np.minimum(tri_max[:, 1], W - 1)
+    tri_max[:, 2] = np.minimum(tri_max[:, 2], D - 1)
 
-    mask = inside.reshape(vol_shape).astype(np.uint8)
+    # Fill bounding box of each triangle
+    for i in range(len(faces)):
+        x0, y0, z0 = tri_min[i]
+        x1, y1, z1 = tri_max[i]
+        shell[x0:x1+1, y0:y1+1, z0:z1+1] = 1
 
-    return mask
+    return shell
 
 
-def compute_sdf_from_mask(mask):
+def compute_sdf(vertices, faces, vol_shape):
     """
-    Compute a signed distance function from a binary mask.
-    Positive values are outside the surface, negative values are inside.
+    Compute SDF for a single surface mesh using fast method.
+
+    Steps:
+        1. Rasterize triangles to get surface shell
+        2. binary_fill_holes to determine interior
+        3. EDT from shell boundary
+        4. SDF = positive outside, negative inside
 
     Args:
-        mask: (H, W, D) binary numpy array (1=inside, 0=outside)
+        vertices: (N, 3) voxel-space coordinates
+        faces: (M, 3) face indices
+        vol_shape: (H, W, D)
 
     Returns:
-        sdf: (H, W, D) numpy float32 array
+        sdf: (H, W, D) float32 array
     """
-    # Distance transform for outside (where mask == 0)
-    dist_outside = distance_transform_edt(1 - mask).astype(np.float32)
+    # Step 1: Rasterize surface into shell
+    shell = rasterize_triangles_fast(vertices, faces, vol_shape)
 
-    # Distance transform for inside (where mask == 1)
-    dist_inside = distance_transform_edt(mask).astype(np.float32)
+    # Step 2: Fill holes to find interior
+    # binary_fill_holes: everything unreachable from outside = interior
+    filled = binary_fill_holes(shell).astype(np.uint8)
 
-    # SDF: positive outside, negative inside
-    sdf = dist_outside - dist_inside
+    # Step 3: Compute distance from surface shell
+    # EDT of (1 - shell) gives distance to nearest shell voxel
+    dist_from_surface = distance_transform_edt(1 - shell).astype(np.float32)
+
+    # Step 4: Assign sign based on inside/outside
+    # filled=1 and shell=0 means interior -> negative distance
+    interior = (filled == 1) & (shell == 0)
+    sdf = dist_from_surface.copy()
+    sdf[interior] = -sdf[interior]
+    sdf[shell == 1] = 0.0
 
     return sdf
 
 
 def merge_hemisphere_sdfs(sdf_lh, sdf_rh):
     """
-    Merge left and right hemisphere SDFs into a single SDF volume.
-    Uses the minimum absolute distance (union of surfaces).
-
-    Args:
-        sdf_lh: (H, W, D) SDF for left hemisphere
-        sdf_rh: (H, W, D) SDF for right hemisphere
-
-    Returns:
-        sdf_merged: (H, W, D) merged SDF
+    Merge left and right hemisphere SDFs (union).
+    Takes the SDF with smaller absolute value at each voxel.
     """
-    # For union: take the minimum of the two SDFs
-    # Where both are positive (outside both), take the smaller positive value
-    # Where both are negative (inside both), take the larger (less negative) value
-    # Where signs differ, take the negative one (inside at least one surface)
-    sdf_merged = np.where(
+    return np.where(
         np.abs(sdf_lh) < np.abs(sdf_rh),
         sdf_lh,
         sdf_rh
     )
-    return sdf_merged
 
 
 def process_subject(args):
     """
-    Process a single subject: generate SDF volumes for pial and white surfaces.
-
-    Args:
-        args: tuple of (subject_dir, output_pial_dir, output_white_dir, resolution)
+    Process a single subject: generate pial and white SDF volumes.
 
     Returns:
-        subject_id: string ID of the subject, or None if failed
+        subject_id or None if failed/skipped
     """
-    subject_dir, output_pial_dir, output_white_dir, resolution = args
-
+    subject_dir, output_pial_dir, output_white_dir = args
     subject_id = os.path.basename(subject_dir)
 
     try:
-        # --- Check required files exist ---
         surf_dir = os.path.join(subject_dir, 'surf')
         mri_dir = os.path.join(subject_dir, 'mri')
 
+        # Check required files
         required_surfs = ['lh.pial', 'rh.pial', 'lh.white', 'rh.white']
         for s in required_surfs:
             if not os.path.exists(os.path.join(surf_dir, s)):
@@ -156,12 +158,22 @@ def process_subject(args):
             LOG.warning(f"[SKIP] {subject_id}: missing T1.mgz")
             return None
 
-        # --- Load reference volume for affine and shape ---
+        # Skip if already processed
+        out_pial = os.path.join(output_pial_dir, f"{subject_id}.nii.gz")
+        out_white = os.path.join(output_white_dir, f"{subject_id}.nii.gz")
+        if os.path.exists(out_pial) and os.path.exists(out_white):
+            LOG.info(f"[SKIP] {subject_id}: already processed")
+            return subject_id
+
+        # Load reference volume for affine and shape
         ref_img = nib.load(ref_mgz)
         affine = ref_img.affine
         vol_shape = ref_img.shape[:3]  # (256, 256, 256)
+        inv_affine = np.linalg.inv(affine)
 
-        # --- Generate Pial SDF ---
+        # ===== Pial SDF =====
+        LOG.info(f"[{subject_id}] Computing pial SDF...")
+
         lh_pial_v, lh_pial_f = nib.freesurfer.read_geometry(
             os.path.join(surf_dir, 'lh.pial')
         )
@@ -169,19 +181,19 @@ def process_subject(args):
             os.path.join(surf_dir, 'rh.pial')
         )
 
-        LOG.info(f"[{subject_id}] Computing pial SDF...")
-        lh_pial_mask = surface_to_volume_mask(lh_pial_v, lh_pial_f, vol_shape, affine)
-        rh_pial_mask = surface_to_volume_mask(rh_pial_v, rh_pial_f, vol_shape, affine)
+        # Convert world (RAS) to voxel coordinates
+        lh_pial_vox = nib.affines.apply_affine(inv_affine, lh_pial_v)
+        rh_pial_vox = nib.affines.apply_affine(inv_affine, rh_pial_v)
 
-        lh_pial_sdf = compute_sdf_from_mask(lh_pial_mask)
-        rh_pial_sdf = compute_sdf_from_mask(rh_pial_mask)
+        lh_pial_sdf = compute_sdf(lh_pial_vox, lh_pial_f, vol_shape)
+        rh_pial_sdf = compute_sdf(rh_pial_vox, rh_pial_f, vol_shape)
         pial_sdf = merge_hemisphere_sdfs(lh_pial_sdf, rh_pial_sdf)
 
-        # Save pial SDF
-        out_pial = os.path.join(output_pial_dir, f"{subject_id}.nii.gz")
         nib.save(nib.Nifti1Image(pial_sdf, affine=affine), out_pial)
 
-        # --- Generate White SDF ---
+        # ===== White SDF =====
+        LOG.info(f"[{subject_id}] Computing white SDF...")
+
         lh_white_v, lh_white_f = nib.freesurfer.read_geometry(
             os.path.join(surf_dir, 'lh.white')
         )
@@ -189,16 +201,13 @@ def process_subject(args):
             os.path.join(surf_dir, 'rh.white')
         )
 
-        LOG.info(f"[{subject_id}] Computing white SDF...")
-        lh_white_mask = surface_to_volume_mask(lh_white_v, lh_white_f, vol_shape, affine)
-        rh_white_mask = surface_to_volume_mask(rh_white_v, rh_white_f, vol_shape, affine)
+        lh_white_vox = nib.affines.apply_affine(inv_affine, lh_white_v)
+        rh_white_vox = nib.affines.apply_affine(inv_affine, rh_white_v)
 
-        lh_white_sdf = compute_sdf_from_mask(lh_white_mask)
-        rh_white_sdf = compute_sdf_from_mask(rh_white_mask)
+        lh_white_sdf = compute_sdf(lh_white_vox, lh_white_f, vol_shape)
+        rh_white_sdf = compute_sdf(rh_white_vox, rh_white_f, vol_shape)
         white_sdf = merge_hemisphere_sdfs(lh_white_sdf, rh_white_sdf)
 
-        # Save white SDF
-        out_white = os.path.join(output_white_dir, f"{subject_id}.nii.gz")
         nib.save(nib.Nifti1Image(white_sdf, affine=affine), out_white)
 
         LOG.info(f"[DONE] {subject_id}")
@@ -212,21 +221,15 @@ def process_subject(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate SDF volumes from FreeSurfer cortical surfaces"
+        description="Generate SDF volumes from FreeSurfer cortical surfaces (FAST)"
     )
     parser.add_argument(
         '--fs_dir', type=str, required=True,
-        help='Path to FreeSurfer subjects directory '
-             '(e.g., /data/datasets/CamCAN/freesurfer)'
+        help='Path to FreeSurfer subjects directory'
     )
     parser.add_argument(
         '--output_dir', type=str, required=True,
-        help='Output directory for processed data '
-             '(e.g., /data/yunmin0111/dataset)'
-    )
-    parser.add_argument(
-        '--resolution', type=int, default=256,
-        help='Volume resolution (default: 256, will be resized to 128 during training)'
+        help='Output directory for processed data'
     )
     parser.add_argument(
         '--num_workers', type=int, default=4,
@@ -234,13 +237,11 @@ def main():
     )
     args = parser.parse_args()
 
-    # Create output directories
     output_pial_dir = os.path.join(args.output_dir, 'sdf_pial')
     output_white_dir = os.path.join(args.output_dir, 'sdf_white')
     os.makedirs(output_pial_dir, exist_ok=True)
     os.makedirs(output_white_dir, exist_ok=True)
 
-    # Get list of subjects
     subjects = sorted([
         os.path.join(args.fs_dir, d)
         for d in os.listdir(args.fs_dir)
@@ -251,13 +252,11 @@ def main():
     LOG.info(f"Output pial SDF: {output_pial_dir}")
     LOG.info(f"Output white SDF: {output_white_dir}")
 
-    # Prepare arguments for parallel processing
     task_args = [
-        (subj, output_pial_dir, output_white_dir, args.resolution)
+        (subj, output_pial_dir, output_white_dir)
         for subj in subjects
     ]
 
-    # Process subjects
     if args.num_workers > 1:
         with Pool(args.num_workers) as pool:
             results = list(tqdm(
@@ -270,15 +269,13 @@ def main():
         for task in tqdm(task_args, desc="Generating SDFs"):
             results.append(process_subject(task))
 
-    # Summary
     successful = [r for r in results if r is not None]
     failed = len(results) - len(successful)
     LOG.info(f"\n=== Summary ===")
-    LOG.info(f"Total subjects: {len(results)}")
+    LOG.info(f"Total: {len(results)}")
     LOG.info(f"Successful: {len(successful)}")
     LOG.info(f"Failed/Skipped: {failed}")
 
-    # Save list of successful subjects
     id_list_path = os.path.join(args.output_dir, 'valid_subjects.txt')
     with open(id_list_path, 'w') as f:
         for s in sorted(successful):
