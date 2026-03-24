@@ -37,18 +37,16 @@ LOG = logging.getLogger(__name__)
 
 def extract_subject_id(filename):
     """
-    Extract numeric subject ID from filename.
+    Extract subject ID (CC number) from filename.
     e.g., 'sub-CC110037_defaced_T1.nii.gz' -> '110037'
-          'wmsub-CC110037_defaced_T1.nii' -> '110037'
-
-    Args:
-        filename: string filename
-
-    Returns:
-        numeric_id: string of digits
+          'wmsub-CC110037_defaced_T1.nii'   -> '110037'
     """
-    digits = re.findall(r'\d+', filename)
-    return ''.join(digits)
+    import re
+    match = re.search(r'CC(\d+)', filename)
+    if match:
+        return match.group(1)
+    # fallback: return all digits
+    return ''.join(re.findall(r'\d+', filename))
 
 
 def main():
