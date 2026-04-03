@@ -73,7 +73,7 @@ def generate_edge_map_from_ribbon(ribbon_data):
     edges are perfectly aligned with all other data.
     """
     H, W, D = ribbon_data.shape
-    edge = np.zeros_like(ribbon_data, dtype=np.float32)
+    edge = np.zeros_like(ribbon_data, dtype=np.uint8)
     
     # Only check voxels that are non-zero (brain tissue)
     # and their neighbors for label changes
