@@ -1,0 +1,70 @@
+# WDM-Cor2Vox Config
+# Wavelet Diffusion Model for 256³ brain MRI synthesis on RTX 3090
+#
+# Key changes from original:
+#   - MRI target: 8ch wavelet (all subbands)
+#   - Shape prior Sc: 8ch wavelet (all subbands)
+#   - Conditions: 1ch each (LLL only)
+#   - UNet processes 128³ spatially, but captures 256³ information
+#   - in_channels adjusted for wavelet channels
+
+data:
+  dataset_type: 'wavelet_c2v'  # use WaveletC2vDataset
+  dataset_config:
+    img_folder: '/data/yunmin0111/dataset_v3/mri'
+    shape_folder: '/data/yunmin0111/dataset_v3/sdf_pial'
+    shape_folder_2: '/data/yunmin0111/dataset_v3/sdf_white'
+    condition_folder: '/data/yunmin0111/dataset_v3/sdf_pial'
+    condition_folder_2: '/data/yunmin0111/dataset_v3/sdf_white'
+    condition_folder_3: '/data/yunmin0111/dataset_v3/edge_map'
+    condition_folder_4: '/data/yunmin0111/dataset_v3/ribbon_mask'
+    input_size: 128    # spatial size after DWT (not used for resize)
+    depth_size: 128
+
+model:
+  model_name: "c2v_wdm"
+  model_load_path: ''
+  optim_sche_load_path: ''
+
+  BB:
+    optimizer:
+      weight_decay: 0.000
+      optimizer: 'Adam'
+      lr: 1.0e-4
+    lr_scheduler:
+      type: 'ReduceLROnPlateau'
+      factor: 0.5
+      patience: 20
+
+    params:
+      mt_type: 'linear'
+      skip_sample: True
+      sample_type: 'linear'
+      sample_step: 10
+      num_timesteps: 1000
+      eta: 1.0
+      max_var: 1.0
+      channels: 8          # MRI wavelet channels (output)
+      condition_channels: 6 # shape_context(2) + conditions(4) 
+      loss_type: 'l1'
+      image_size: 128
+      use_fp16: False
+
+    UNetParams:
+      image_size: 128
+      # in_channels = x_t(8) + Sc(8) + context(2) + condition(4) = 22
+      in_channels: 22
+      model_channels: 32
+      # out_channels = 8 (wavelet MRI)
+      out_channels: 8
+      num_res_blocks: 2
+      attention_resolutions: !!python/tuple [16]
+      dropout: 0
+      channel_mult: !!python/tuple [1, 2, 3, 4]
+      conv_resample: True
+      dims: 3
+      use_checkpoint: False
+      num_heads: 4
+      num_head_channels: 32
+      resblock_updown: True
+      use_fp16: False
