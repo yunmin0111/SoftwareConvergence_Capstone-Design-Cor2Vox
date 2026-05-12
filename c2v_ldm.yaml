@@ -1,0 +1,57 @@
+data:
+  dataset_type: 'c2v'
+  dataset_config:
+    img_folder: '/data/yunmin0111/dataset_v3/mri'
+    shape_folder: '/data/yunmin0111/dataset_v3/sdf_pial'
+    shape_folder_2: '/data/yunmin0111/dataset_v3/sdf_white'
+    condition_folder: '/data/yunmin0111/dataset_v3/ribbon_mask'
+    input_size: 128
+    depth_size: 128
+
+model:
+  model_name: "c2v_ldm"
+  model_load_path: ''
+  optim_sche_load_path: ''
+
+  autoencoder:
+    latent_dim: 4
+    base_channels: 32
+    kl_weight: 1.0e-6
+    epochs: 100
+
+  BB:
+    optimizer:
+      weight_decay: 0.000
+      optimizer: 'Adam'
+      lr: 1.0e-4
+    lr_scheduler:
+      type: 'ReduceLROnPlateau'
+      factor: 0.5
+      patience: 20
+
+    params:
+      mt_type: 'linear'
+      skip_sample: true
+      sample_type: 'linear'
+      sample_step: 10
+      num_timesteps: 1000
+      eta: 1.0
+      max_var: 1.0
+      objective: 'grad'
+      channels: 4
+      condition_channels: 1
+      loss_type: 'l1'
+      image_size: 32
+      use_fp16: false
+
+    UNetParams:
+      image_size: 32
+      in_channels: 9
+      model_channels: 64
+      out_channels: 4
+      num_res_blocks: 2
+      channel_mult:
+        - 1
+        - 2
+        - 4
+      condition_key: "nocond"
